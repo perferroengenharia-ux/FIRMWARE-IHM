@@ -36,6 +36,16 @@
 
 #include "ota.h" //OTA para atualizar o firmware de forma online
 
+// ---------- Fallback tunables ----------
+#define FB_STA_RETRY_MS                 10000  // 10s entre tentativas STA
+#define FB_AP_ON_AFTER_OFFLINE_MS        5000  // 5s offline -> liga AP
+#define FB_AP_OFF_AFTER_MQTT_OK_MS       3000  // 3s MQTT ok -> desliga AP
+// Flags de conectividade e controle do AP de fallback
+static volatile bool s_mqtt_connected = false;
+static bool s_ap_control_on = false;
+static bool s_control_uris_registered = false;
+
+
 // ============================ CONFIGURAR AQUI ============================
 // Identidade e Broker
 #define ORG_ID         "app-user-org01"                      // TODO
@@ -54,14 +64,14 @@
 // ========================SIMULAÇÃO======================================
 #define LED_GPIO 2
 #define PIN_SWING  GPIO_NUM_25
-#define PIN_dreno  GPIO_NUM_26
-#define PIN_bomba   GPIO_NUM_27
+#define PIN_DRAIN  GPIO_NUM_26
+#define PIN_PUMP   GPIO_NUM_27
 
 // Botão de reset Wi-Fi (liga no GND; interno em pull-up)
 #define BTN_WIFI_RST   GPIO_NUM_13
 
 
-static bool s_ventilador = false, st_swing=false, st_dreno=false, st_bomba=false;
+static bool s_led_on = false, st_swing=false, st_drain=false, st_pump=false;
 // ========================================================================
 
 static const char *TAG = "APP";
@@ -82,49 +92,56 @@ typedef struct {
     char pass[65];
 } sta_cfg_t;
 
-// ---------- Fallback tunables ----------
-#define FB_STA_RETRY_MS                 10000  // 10s entre tentativas STA
-#define FB_AP_ON_AFTER_OFFLINE_MS        5000  // 5s offline -> liga AP
-#define FB_AP_OFF_AFTER_MQTT_OK_MS       3000  // 3s MQTT ok -> desliga AP
+static httpd_handle_t s_httpd = NULL;
 
-// Flags de conectividade e controle do AP de fallback
-static volatile bool s_mqtt_connected = false;
-static bool s_ap_control_on = false;
-static bool s_control_uris_registered = false;
-
-//=================================================================CABEÇALHO DE FUNÇÕES========================================
+//============================================================PROTÓTIPO DE FUNÇÕES==========================================
+// Provisionamento
 static void switch_to_sta_task(void *arg);
+static esp_err_t prov_post_handler(httpd_req_t *req);
+static void start_ap_and_http(void);
+static bool app_is_provisioned(void);
+
+
+// Utilitários / Hardware
+static void httpd_start_if_needed(void);
 static void start_control_ap(void);
 static void stop_control_ap(void);
 static inline void set_active_low(gpio_num_t pin, bool on);
 static void update_peripherals_from_state(void);
-static void force_all_off(void) ;
+static void force_all_off(void);
 static void led_init(void);
 static void app_sntp_sync_time(void);
 static char* dup_payload(const char *data, int len);
-static bool app_is_provisioned(void);
-static esp_err_t prov_post_handler(httpd_req_t *req);
-static void start_ap_and_http(void);
+
+
+// HTTP de Controle
 static esp_err_t api_ping_handler(httpd_req_t *req);
-static char* build_reported_json(void);
+static char* build_reported_json(void); // protótipo já estava no seu código original
 static esp_err_t api_state_handler(httpd_req_t *req);
 static esp_err_t api_cmd_handler(httpd_req_t *req);
 static void http_register_control_api(void);
-static void httpd_start_if_needed(void);
+
+
+// Wi-Fi STA
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
 static void wifi_init_driver(void);
 static void wifi_start_sta(void);
 static void wifi_wait_connected(void);
-static char* build_reported_json(void);
+
+
+// MQTT
 static void publish_reported(void);
 static void handle_cmd(const char *payload, int len);
 static void handle_desired(const char *payload, int len);
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 static void mqtt_start(void);
+
+
+// Outras Tarefas/Utilitários
 static void reset_wifi_and_reboot(void);
 static void btn_wifi_reset_task(void *arg);
 static void link_fallback_task(void *arg);
-//============================================================CABEÇALHOS=====================================================
+//===========================================================================================================================
 
 static void switch_to_sta_task(void *arg) {
     sta_cfg_t *cfg = (sta_cfg_t*)arg;
@@ -144,11 +161,22 @@ static void switch_to_sta_task(void *arg) {
 
     free(cfg);
     // se preferir reiniciar depois de obter IP, remova o restart:
-    ESP_LOGI(TAG, "Trocando para STA, tentando conectar com SSID='%s'", sta.sta.ssid);
-    vTaskDelete(NULL);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
 }
 
 // ------------------------- Utilidades -------------------------
+static void httpd_start_if_needed(void) {
+    if (!s_httpd) {
+        httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+        cfg.server_port = 80;
+        if (httpd_start(&s_httpd, &cfg) == ESP_OK) {
+            ESP_LOGI(TAG, "HTTP server ativo para controle local");
+        }
+    }
+    http_register_control_api();
+}
+
 static void start_control_ap(void) {
     wifi_config_t ap = {0};
     uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -164,7 +192,7 @@ static void start_control_ap(void) {
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     }
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_wifi_start(); // se já estiver started, não tem problema
 
     // Garante HTTP ativo e endpoints /api/*
     httpd_start_if_needed();
@@ -190,27 +218,27 @@ static inline void set_active_low(gpio_num_t pin, bool on) {
 // --- [ADD] Helpers de saída: aplicação de estados + dependência do LED ---
 static void update_peripherals_from_state(void) {
     // LED é ativo alto
-    gpio_set_level(LED_GPIO, s_ventilador ? 1 : 0);
+    gpio_set_level(LED_GPIO, s_led_on ? 1 : 0);
 
     // Demais periféricos são ativos baixos e só podem ligar se o LED estiver ON
-    bool allow = s_ventilador;
+    bool allow = s_led_on;
     set_active_low(PIN_SWING, allow && st_swing);
-    set_active_low(PIN_dreno, allow && st_dreno);
-    set_active_low(PIN_bomba,  allow && st_bomba);
+    set_active_low(PIN_DRAIN, allow && st_drain);
+    set_active_low(PIN_PUMP,  allow && st_pump);
 }
 
 // Desliga tudo (estado e hardware)
 static void force_all_off(void) {
-    s_ventilador = false;
+    s_led_on = false;
     st_swing = false;
-    st_dreno = false;
-    st_bomba  = false;
+    st_drain = false;
+    st_pump  = false;
     update_peripherals_from_state();
 }
 
-static void led_init(void) {
+static void led_init(void){
     gpio_config_t io = {
-        .pin_bit_mask = (1ULL << LED_GPIO) | (1ULL<<PIN_SWING) | (1ULL<<PIN_dreno) | (1ULL<<PIN_bomba),
+        .pin_bit_mask = (1ULL << LED_GPIO) | (1ULL<<PIN_SWING) | (1ULL<<PIN_DRAIN) | (1ULL<<PIN_PUMP),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -229,12 +257,6 @@ static void led_init(void) {
     };
     gpio_config(&in);
 }
-
-/*static void get_service_name(char *name, size_t max) {
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    snprintf(name, max, PROV_DEVICE_NAME_PREFIX"%02X%02X%02X", mac[3], mac[4], mac[5]);
-}*/
 
 static void app_sntp_sync_time(void) {
     ESP_LOGI(TAG, "Sincronizando SNTP...");
@@ -288,8 +310,6 @@ static bool app_is_provisioned(void) {
 }
 
 // ---- INÍCIO: provisão simples por HTTP ----
-static httpd_handle_t s_httpd = NULL;
-
 static esp_err_t prov_post_handler(httpd_req_t *req) {
     char buf[256];
     int r = httpd_req_recv(req, buf, MIN(req->content_len, (sizeof(buf)-1)));
@@ -357,6 +377,8 @@ static esp_err_t api_ping_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static char* build_reported_json(void); // protótipo (def. mais abaixo)
+
 static esp_err_t api_state_handler(httpd_req_t *req) {
     char *msg = build_reported_json();
     if (!msg) {
@@ -406,40 +428,21 @@ static void http_register_control_api(void) {
     ESP_LOGI(TAG, "Endpoints de controle /api/* registrados");
 }
 
-static void httpd_start_if_needed(void) {
-    if (!s_httpd) {
-        httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-        cfg.server_port = 80;
-        if (httpd_start(&s_httpd, &cfg) == ESP_OK) {
-            ESP_LOGI(TAG, "HTTP server ativo para controle local");
-        }
-    }
-    http_register_control_api();
-}
 // ========================================================================
 
 
 // ------------------------- Wi-Fi STA -------------------------
-static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
-    wifi_mode_t mode;
-    esp_wifi_get_mode(&mode);
-    if (mode & WIFI_MODE_AP) {
-        ESP_LOGW(TAG, "Ignorando tentativa de reconexão — modo AP ativo.");
-        return;
-    }
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT) {
         switch (event_id) {
             case WIFI_EVENT_STA_START:
                 esp_wifi_connect();
                 break;
             case WIFI_EVENT_STA_DISCONNECTED:
-                ESP_LOGW(TAG, "Wi-Fi desconectado — SSID fora de alcance ou senha incorreta.");
+                ESP_LOGW(TAG, "Wi-Fi desconectado, reconectando...");
                 esp_wifi_connect();
-                if (s_wifi_event_group != NULL) {
-                    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-                } else {
-                    ESP_LOGW(TAG, "WiFi event group ainda não inicializado, ignorando clear.");
-                }
+                xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
                 break;
             default: break;
         }
@@ -481,25 +484,24 @@ static void wifi_wait_connected(void) {
         s_wifi_event_group = xEventGroupCreate();
     }
     // Espera até obter GOT_IP, com re-tentativa
-    int retry = 0;
-    const int max_retries = 5;
-
-    while (retry < max_retries) {
+    while (true) {
         EventBits_t bits = xEventGroupWaitBits(
             s_wifi_event_group, WIFI_CONNECTED_BIT,
-            pdFALSE, pdTRUE, pdMS_TO_TICKS(10000)  // espera 10s por tentativa
+            pdFALSE, pdFALSE, pdMS_TO_TICKS(30000)  // espera 30s por tentativa
         );
         if (bits & WIFI_CONNECTED_BIT) {
-            ESP_LOGI(TAG, "Wi-Fi conectado com sucesso.");
+            ESP_LOGI(TAG, "Conectado e com IP.");
             break;
         }
-        retry++;
-        ESP_LOGW(TAG, "Falha na conexão Wi-Fi (%d/%d).", retry, max_retries);
+        ESP_LOGW(TAG, "Ainda sem IP, tentando de novo...");
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_wifi_connect();
     }
-    ESP_LOGE(TAG, "Limite de tentativas excedido — iniciando modo AP de controle.");
-    if (!s_ap_control_on) start_control_ap();
 }
 
+
+// ------------------------- MQTT -------------------------
 // Constrói o JSON de estado para /api/state e para o MQTT reported
 static char* build_reported_json(void) {
     cJSON *root = cJSON_CreateObject();
@@ -509,10 +511,10 @@ static char* build_reported_json(void) {
     cJSON_AddStringToObject(root, "fw", CONFIG_APP_PROJECT_VER);
 
     cJSON *hw = cJSON_CreateObject();
-    cJSON_AddBoolToObject(hw, "ventilador", s_ventilador);
+    cJSON_AddBoolToObject(hw, "led_on", s_led_on);
     cJSON_AddBoolToObject(hw, "swing",  st_swing);
-    cJSON_AddBoolToObject(hw, "dreno",  st_dreno);
-    cJSON_AddBoolToObject(hw, "bomba",   st_bomba);
+    cJSON_AddBoolToObject(hw, "drain",  st_drain);
+    cJSON_AddBoolToObject(hw, "pump",   st_pump);
     cJSON_AddItemToObject(root, "hw", hw);
 
     char *msg = cJSON_PrintUnformatted(root);
@@ -521,32 +523,14 @@ static char* build_reported_json(void) {
 }
 
 
-// ------------------------- MQTT -------------------------
 static void publish_reported(void) {
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddNumberToObject(root, "ts", (double)time(NULL));
-    cJSON_AddStringToObject(root, "fw", CONFIG_APP_PROJECT_VER);
-
-    //cJSON *sensors = cJSON_CreateObject();
-    //cJSON_AddNumberToObject(sensors, "temp", 23.4);
-    //cJSON_AddNumberToObject(sensors, "flow", 12.1);
-    //cJSON_AddItemToObject(root, "sensors", sensors);
-
-    cJSON *hw = cJSON_CreateObject();
-    cJSON_AddBoolToObject(hw, "ventilador", s_ventilador);
-    cJSON_AddBoolToObject(hw, "swing",  st_swing);  // <- nome sem "_on"
-    cJSON_AddBoolToObject(hw, "dreno",  st_dreno);
-    cJSON_AddBoolToObject(hw, "bomba",   st_bomba);
-    cJSON_AddItemToObject(root, "hw", hw);
-
-    char *msg = cJSON_PrintUnformatted(root);
-    if (msg) {
-        int id = esp_mqtt_client_publish(client, topic_reported, msg, 0, 1, 1);
-        ESP_LOGI(TAG, "PUB reported (id=%d): %s", id, msg);
-        free(msg);
-    }
-    cJSON_Delete(root);
+    char *msg = build_reported_json();
+    if (!msg) return;
+    int id = esp_mqtt_client_publish(client, topic_reported, msg, 0, 1, 1);
+    ESP_LOGI(TAG, "PUB reported (id=%d): %s", id, msg);
+    free(msg);
 }
+
 
 
 static void handle_cmd(const char *payload, int len) {
@@ -572,35 +556,35 @@ static void handle_cmd(const char *payload, int len) {
         else if (strcmp(op->valuestring, "led") == 0) {
             const cJSON *on = cJSON_GetObjectItem(data, "on");
             if (cJSON_IsBool(on)) {
-                s_ventilador = cJSON_IsTrue(on);
+                s_led_on = cJSON_IsTrue(on);
 
             // Se LED desligar, todos os periféricos também desligam (estado + hardware)
-                if (!s_ventilador) {
-                    st_swing = st_dreno = st_bomba = false;
+                if (!s_led_on) {
+                    st_swing = st_drain = st_pump = false;
                 }
                 update_peripherals_from_state();
-                ESP_LOGI(TAG, "VENTILADOR %s", s_ventilador ? "ON" : "OFF");
+                ESP_LOGI(TAG, "VENTILADOR %s", s_led_on ? "ON" : "OFF");
             }
         }
 
         // Swing/Dreno/Bomba (ativo BAIXO)
         else if (strcmp(op->valuestring, "swing") == 0) {
             bool on = cJSON_IsTrue(cJSON_GetObjectItem(data, "on"));
-            st_swing = on && s_ventilador;
+            st_swing = on && s_led_on;
             update_peripherals_from_state();
             ESP_LOGI(TAG, "SWING %s", st_swing ? "ON" : "OFF");
         }
         else if (strcmp(op->valuestring, "dreno") == 0) {
             bool on = cJSON_IsTrue(cJSON_GetObjectItem(data, "on"));
-            st_dreno = on && s_ventilador;
+            st_drain = on && s_led_on;
             update_peripherals_from_state();
-            ESP_LOGI(TAG, "DRENO %s", st_dreno ? "ON" : "OFF");
+            ESP_LOGI(TAG, "DRENO %s", st_drain ? "ON" : "OFF");
         }
         else if (strcmp(op->valuestring, "bomba") == 0) {
             bool on = cJSON_IsTrue(cJSON_GetObjectItem(data, "on"));
-            st_bomba = on && s_ventilador;
+            st_pump = on && s_led_on;
             update_peripherals_from_state();
-            ESP_LOGI(TAG, "BOMBA %s", st_bomba ? "ON" : "OFF");
+            ESP_LOGI(TAG, "BOMBA %s", st_pump ? "ON" : "OFF");
         }
     }
 
@@ -655,13 +639,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
-            ESP_LOGI(TAG, "MQTT conectado");
-            if (s_ap_control_on) {
-                ESP_LOGI(TAG, "Desligando modo AP em 3s (MQTT restabelecido)...");
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                stop_control_ap();
-            }
             s_mqtt_connected = true;
+            ESP_LOGI(TAG, "MQTT conectado");
             esp_mqtt_client_publish(client, topic_lwt, "online", 0, 1, 1);
             esp_mqtt_client_subscribe(client, topic_desired, 1);
             esp_mqtt_client_subscribe(client, topic_cmd, 1);
@@ -671,7 +650,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_DISCONNECTED:
             s_mqtt_connected = false;
             ESP_LOGW(TAG, "MQTT desconectado");
-        break;
+            break;
+
 
         case MQTT_EVENT_DATA:
             ESP_LOGI(TAG, "Msg em [%.*s], %d bytes",
@@ -723,7 +703,7 @@ static void mqtt_start(void) {
     esp_mqtt_client_start(client);
 }
 
-static void reset_wifi_and_reboot(void) {
+static void reset_wifi_and_reboot(void){
     ESP_LOGW(TAG, "Resetando credenciais Wi-Fi + flag de provisionamento...");    
 
     // [ADD] Desliga imediatamente todos os periféricos (estado + hardware)
@@ -750,7 +730,7 @@ static void reset_wifi_and_reboot(void) {
 }
 
 // Tarefa simples de detecção de long-press (>=5s)
-static void btn_wifi_reset_task(void *arg) {
+static void btn_wifi_reset_task(void *arg){
     const int hold_ms = 5000;
     int pressed_ms = 0;
 
@@ -778,13 +758,6 @@ static void link_fallback_task(void *arg) {
     int64_t last_sta_try_ms = 0;
     int64_t offline_since_ms = 0;
     int64_t mqtt_ok_since_ms = 0;
-
-    wifi_mode_t mode;
-    esp_wifi_get_mode(&mode);
-    if (mode & WIFI_MODE_AP) {
-        ESP_LOGW(TAG, "Ignorando tentativa de reconexão — modo AP ativo.");
-        return;
-}
 
     for (;;) {
         int64_t now_ms = esp_timer_get_time() / 1000;
@@ -848,7 +821,7 @@ void app_main(void) {
     // Espera IP (até 15s)
     wifi_wait_connected();
 
-    // Habilita HTTP de controle também via LAN (STA)
+        // Habilita HTTP de controle também via LAN (STA)
     httpd_start_if_needed();
 
 
@@ -857,7 +830,9 @@ void app_main(void) {
 
     // Função do LED para teste
     led_init();
-    xTaskCreatePinnedToCore(btn_wifi_reset_task, "btn_wifi_rst", 3072, NULL, 5, NULL, tskNO_AFFINITY);
+
+    xTaskCreatePinnedToCore(btn_wifi_reset_task, "btn_wifi_rst", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 0);
+
 
 
     // MQTT com TLS
