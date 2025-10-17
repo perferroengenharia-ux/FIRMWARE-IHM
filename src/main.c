@@ -1,4 +1,4 @@
-// src/main.c — ESP32 (ESP-IDF via PlatformIO) com Provisionamento SoftAP + MQTT/TLS + LWT + JSON
+ // src/main.c — ESP32 (ESP-IDF via PlatformIO) com Provisionamento SoftAP + MQTT/TLS + LWT + JSON
 
 #include <stdio.h>
 #include <string.h>
