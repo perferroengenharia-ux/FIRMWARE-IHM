@@ -64,14 +64,14 @@ static bool s_control_uris_registered = false;
 // ========================SIMULAÇÃO======================================
 #define LED_GPIO 2
 #define PIN_SWING  GPIO_NUM_25
-#define PIN_DRAIN  GPIO_NUM_26
-#define PIN_PUMP   GPIO_NUM_27
+#define PIN_dreno  GPIO_NUM_26
+#define PIN_bomba   GPIO_NUM_27
 
 // Botão de reset Wi-Fi (liga no GND; interno em pull-up)
 #define BTN_WIFI_RST   GPIO_NUM_13
 
 
-static bool s_led_on = false, st_swing=false, st_drain=false, st_pump=false;
+static bool s_ventilador = false, st_swing=false, st_dreno=false, st_bomba=false;
 // ========================================================================
 
 static const char *TAG = "APP";
@@ -218,27 +218,27 @@ static inline void set_active_low(gpio_num_t pin, bool on) {
 // --- [ADD] Helpers de saída: aplicação de estados + dependência do LED ---
 static void update_peripherals_from_state(void) {
     // LED é ativo alto
-    gpio_set_level(LED_GPIO, s_led_on ? 1 : 0);
+    gpio_set_level(LED_GPIO, s_ventilador ? 1 : 0);
 
     // Demais periféricos são ativos baixos e só podem ligar se o LED estiver ON
-    bool allow = s_led_on;
+    bool allow = s_ventilador;
     set_active_low(PIN_SWING, allow && st_swing);
-    set_active_low(PIN_DRAIN, allow && st_drain);
-    set_active_low(PIN_PUMP,  allow && st_pump);
+    set_active_low(PIN_dreno, allow && st_dreno);
+    set_active_low(PIN_bomba,  allow && st_bomba);
 }
 
 // Desliga tudo (estado e hardware)
 static void force_all_off(void) {
-    s_led_on = false;
+    s_ventilador = false;
     st_swing = false;
-    st_drain = false;
-    st_pump  = false;
+    st_dreno = false;
+    st_bomba  = false;
     update_peripherals_from_state();
 }
 
 static void led_init(void){
     gpio_config_t io = {
-        .pin_bit_mask = (1ULL << LED_GPIO) | (1ULL<<PIN_SWING) | (1ULL<<PIN_DRAIN) | (1ULL<<PIN_PUMP),
+        .pin_bit_mask = (1ULL << LED_GPIO) | (1ULL<<PIN_SWING) | (1ULL<<PIN_dreno) | (1ULL<<PIN_bomba),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -511,10 +511,10 @@ static char* build_reported_json(void) {
     cJSON_AddStringToObject(root, "fw", CONFIG_APP_PROJECT_VER);
 
     cJSON *hw = cJSON_CreateObject();
-    cJSON_AddBoolToObject(hw, "led_on", s_led_on);
+    cJSON_AddBoolToObject(hw, "ventilador", s_ventilador);
     cJSON_AddBoolToObject(hw, "swing",  st_swing);
-    cJSON_AddBoolToObject(hw, "drain",  st_drain);
-    cJSON_AddBoolToObject(hw, "pump",   st_pump);
+    cJSON_AddBoolToObject(hw, "dreno",  st_dreno);
+    cJSON_AddBoolToObject(hw, "bomba",   st_bomba);
     cJSON_AddItemToObject(root, "hw", hw);
 
     char *msg = cJSON_PrintUnformatted(root);
@@ -556,35 +556,35 @@ static void handle_cmd(const char *payload, int len) {
         else if (strcmp(op->valuestring, "led") == 0) {
             const cJSON *on = cJSON_GetObjectItem(data, "on");
             if (cJSON_IsBool(on)) {
-                s_led_on = cJSON_IsTrue(on);
+                s_ventilador = cJSON_IsTrue(on);
 
             // Se LED desligar, todos os periféricos também desligam (estado + hardware)
-                if (!s_led_on) {
-                    st_swing = st_drain = st_pump = false;
+                if (!s_ventilador) {
+                    st_swing = st_dreno = st_bomba = false;
                 }
                 update_peripherals_from_state();
-                ESP_LOGI(TAG, "VENTILADOR %s", s_led_on ? "ON" : "OFF");
+                ESP_LOGI(TAG, "VENTILADOR %s", s_ventilador ? "ON" : "OFF");
             }
         }
 
         // Swing/Dreno/Bomba (ativo BAIXO)
         else if (strcmp(op->valuestring, "swing") == 0) {
             bool on = cJSON_IsTrue(cJSON_GetObjectItem(data, "on"));
-            st_swing = on && s_led_on;
+            st_swing = on && s_ventilador;
             update_peripherals_from_state();
             ESP_LOGI(TAG, "SWING %s", st_swing ? "ON" : "OFF");
         }
         else if (strcmp(op->valuestring, "dreno") == 0) {
             bool on = cJSON_IsTrue(cJSON_GetObjectItem(data, "on"));
-            st_drain = on && s_led_on;
+            st_dreno = on && s_ventilador;
             update_peripherals_from_state();
-            ESP_LOGI(TAG, "DRENO %s", st_drain ? "ON" : "OFF");
+            ESP_LOGI(TAG, "DRENO %s", st_dreno ? "ON" : "OFF");
         }
         else if (strcmp(op->valuestring, "bomba") == 0) {
             bool on = cJSON_IsTrue(cJSON_GetObjectItem(data, "on"));
-            st_pump = on && s_led_on;
+            st_bomba = on && s_ventilador;
             update_peripherals_from_state();
-            ESP_LOGI(TAG, "BOMBA %s", st_pump ? "ON" : "OFF");
+            ESP_LOGI(TAG, "BOMBA %s", st_bomba ? "ON" : "OFF");
         }
     }
 
